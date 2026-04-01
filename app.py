@@ -232,49 +232,69 @@ def get_media_type(filename: str) -> str:
 # ─────────────────────────────────────────────
 # Claude OCR + 마진 추출
 # ─────────────────────────────────────────────
-EXTRACTION_PROMPT = """
-당신은 한국 이동통신 유통업계 전문가입니다.
+EXTRACTION_PROMPT = """당신은 한국 이동통신 유통업계 전문가입니다.
 첨부된 파일은 유통사의 핸드폰 단가표입니다.
 
-다음 JSON 형식으로만 응답하세요. 다른 텍스트는 절대 포함하지 마세요.
+반드시 아래 JSON 형식으로만 응답하세요.
+- 응답에 JSON 외 다른 텍스트, 설명, 마크다운(```json 등)을 절대 포함하지 마세요.
+- 모든 문자열 값에 줄바꿈(\\n)이나 따옴표(")를 넣지 마세요.
+- 모든 숫자는 반드시 따옴표 없는 숫자형(정수 또는 소수)으로 입력하세요.
 
-{
-  "distributor_name": "유통사명",
-  "carrier": "SKT 또는 KT 또는 LGU+",
-  "currency_unit": "만원 또는 천원",
-  "models": [
-    {
-      "model": "기기명 (예: 아이폰16 Pro, 갤럭시S25)",
-      "MNP": {
-        "액면": 숫자,
-        "TAC": 숫자,
-        "마스콜": 숫자,
-        "특별1": 숫자,
-        "특별2": 숫자,
-        "추지": 숫자,
-        "GR": 숫자,
-        "합계": 숫자
-      },
-      "기변": {
-        "액면": 숫자,
-        "TAC": 숫자,
-        "마스콜": 숫자,
-        "특별1": 숫자,
-        "특별2": 숫자,
-        "추지": 숫자,
-        "GR": 숫자,
-        "합계": 숫자
-      }
-    }
-  ]
-}
+{"distributor_name":"유통사명","carrier":"SKT 또는 KT 또는 LGU+","currency_unit":"만원 또는 천원","models":[{"model":"기기명","MNP":{"액면":0,"TAC":0,"마스콜":0,"특별1":0,"특별2":0,"추지":0,"GR":0,"합계":0},"기변":{"액면":0,"TAC":0,"마스콜":0,"특별1":0,"특별2":0,"추지":0,"GR":0,"합계":0}}]}
 
 규칙:
 - 숫자가 없는 항목은 0으로 기입
 - 합계 = 모든 항목의 합산 (없으면 직접 계산)
-- currency_unit이 "천원"이면 합계를 10으로 나눠 만원 단위로 통일하지 말 것 (원본 단위 그대로 반환)
-- 모델명은 줄임말 없이 최대한 원본 그대로
-"""
+- currency_unit이 "천원"이면 원본 단위 그대로 반환 (만원 변환 금지)
+- 모델명은 줄임말 없이 원본 그대로"""
+
+REPAIR_PROMPT = """아래 JSON 문자열에 문법 오류가 있습니다. 올바른 JSON으로 수정해서 반환하세요.
+마크다운, 설명 텍스트 없이 수정된 JSON만 반환하세요.
+
+오류가 있는 JSON:
+{broken_json}"""
+
+
+def _clean_and_parse_json(raw: str) -> Optional[dict]:
+    """JSON 문자열 정제 후 파싱 — 3단계 시도"""
+    if not raw:
+        return None
+
+    # 1단계: ```json 블록 제거
+    cleaned = re.sub(r"```(?:json)?\s*", "", raw).replace("```", "").strip()
+
+    # 2단계: 제어문자 제거 (줄바꿈은 유지, 탭→공백)
+    cleaned = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", cleaned)
+    cleaned = cleaned.replace("\t", " ")
+
+    # 3단계: 가장 바깥쪽 { } 블록만 추출
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return None
+    cleaned = cleaned[start:end + 1]
+
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        return None
+
+
+def _repair_json_with_claude(client, broken_raw: str) -> Optional[dict]:
+    """파싱 실패 시 Claude에게 JSON 수정 재요청"""
+    try:
+        response = client.messages.create(
+            model="claude-opus-4-5",
+            max_tokens=4096,
+            messages=[{
+                "role": "user",
+                "content": REPAIR_PROMPT.format(broken_json=broken_raw[:8000]),
+            }],
+        )
+        repaired = response.content[0].text.strip()
+        return _clean_and_parse_json(repaired)
+    except Exception:
+        return None
 
 
 def extract_margin_from_image(client, uploaded_file) -> Optional[dict]:
@@ -285,18 +305,12 @@ def extract_margin_from_image(client, uploaded_file) -> Optional[dict]:
 
     if media_type == "application/pdf":
         content = [
-            {
-                "type": "document",
-                "source": {"type": "base64", "media_type": "application/pdf", "data": b64},
-            },
+            {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": b64}},
             {"type": "text", "text": EXTRACTION_PROMPT},
         ]
     else:
         content = [
-            {
-                "type": "image",
-                "source": {"type": "base64", "media_type": media_type, "data": b64},
-            },
+            {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": b64}},
             {"type": "text", "text": EXTRACTION_PROMPT},
         ]
 
@@ -306,11 +320,14 @@ def extract_margin_from_image(client, uploaded_file) -> Optional[dict]:
         messages=[{"role": "user", "content": content}],
     )
     raw = response.content[0].text.strip()
-    # JSON 블록 추출
-    match = re.search(r"\{.*\}", raw, re.DOTALL)
-    if match:
-        return json.loads(match.group())
-    return None
+
+    result = _clean_and_parse_json(raw)
+    if result is None:
+        # 파싱 실패 → Claude에게 수정 재요청
+        result = _repair_json_with_claude(client, raw)
+    if result is None:
+        raise ValueError(f"JSON 파싱 실패. Claude 응답 앞부분: {raw[:200]}")
+    return result
 
 
 def extract_margin_from_text(client, text_content: str) -> Optional[dict]:
@@ -318,18 +335,19 @@ def extract_margin_from_text(client, text_content: str) -> Optional[dict]:
     response = client.messages.create(
         model="claude-opus-4-5",
         max_tokens=4096,
-        messages=[
-            {
-                "role": "user",
-                "content": f"{EXTRACTION_PROMPT}\n\n아래는 파일 내용입니다:\n\n{text_content[:6000]}",
-            }
-        ],
+        messages=[{
+            "role": "user",
+            "content": f"{EXTRACTION_PROMPT}\n\n아래는 파일 내용입니다:\n\n{text_content[:6000]}",
+        }],
     )
     raw = response.content[0].text.strip()
-    match = re.search(r"\{.*\}", raw, re.DOTALL)
-    if match:
-        return json.loads(match.group())
-    return None
+
+    result = _clean_and_parse_json(raw)
+    if result is None:
+        result = _repair_json_with_claude(client, raw)
+    if result is None:
+        raise ValueError(f"JSON 파싱 실패. Claude 응답 앞부분: {raw[:200]}")
+    return result
 
 
 def normalize_to_man(value: float, currency_unit: str) -> float:
@@ -580,8 +598,11 @@ def main():
                         st.session_state.results.append(result)
                     else:
                         st.warning(f"⚠️ {f.name}: 데이터를 추출하지 못했습니다.")
+                except ValueError as e:
+                    st.error(f"❌ {f.name}: Claude 응답 파싱 실패 — {e}")
+                    st.info("💡 이미지가 흐리거나 표 구조가 복잡한 경우 발생할 수 있어요. 더 선명한 이미지로 재시도해주세요.")
                 except Exception as e:
-                    st.error(f"❌ {f.name} 처리 오류: {e}")
+                    st.error(f"❌ {f.name} 처리 오류: {type(e).__name__} — {e}")
 
         progress_bar.empty()
 
