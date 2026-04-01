@@ -385,12 +385,12 @@ def main():
     with st.sidebar:
         st.header("⚙️ 분석 설정")
 
-        st.subheader("1. OpenAI API 키")
+        st.subheader("1. Anthropic API Key")
         api_key = st.text_input(
             "API 키",
             type="password",
             placeholder="sk-...",
-            help="OpenAI API 키. 없으면 데모 데이터를 사용합니다.",
+            help="Anthropic 콘솔에서 발급한 키를 입력하세요",
         )
         use_demo = st.checkbox("🧪 데모 데이터로 테스트", value=(not bool(api_key)))
 
